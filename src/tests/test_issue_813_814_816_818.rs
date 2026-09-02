@@ -9,8 +9,8 @@ extern crate alloc;
 use alloc::format;
 
 use super::helpers::*;
-use crate::{Category, CreateCampaignParams};
-use soroban_sdk::{vec, Address, String};
+use crate::{Category, CreateCampaignParams, Error};
+use soroban_sdk::{testutils::Ledger as _, vec, Address, String};
 
 fn make_campaign_with_title(
     env: &soroban_sdk::Env,
@@ -22,7 +22,7 @@ fn make_campaign_with_title(
     category: Category,
     index: u32,
 ) -> u32 {
-    client.create_campaign(&CreateCampaignParams {
+    let id = client.create_campaign(&CreateCampaignParams {
         creator: creator.clone(),
         title: String::from_str(env, title),
         description: String::from_str(env, "Test description for campaign"),
@@ -32,7 +32,9 @@ fn make_campaign_with_title(
         has_revenue_sharing: false,
         revenue_share_percentage: 0,
         max_contribution_per_user: 0i128,
-    })
+    });
+    client.verify_campaign(&id);
+    id
 }
 
 fn make_campaign(
@@ -54,6 +56,7 @@ fn test_cancel_campaign_decrements_total_raised_global_immediately() {
     token_admin.mint(&contributor, &500);
 
     let id = make_campaign(&env, &client, &creator, 1_000, 30, Category::Educator, 0);
+    client.verify_campaign(&id);
     client.contribute(&id, &contributor, &500);
 
     assert_eq!(client.get_total_raised_global(), 500);
@@ -75,6 +78,7 @@ fn test_cancel_campaign_allows_accept_token_update_after_all_refunds_claimed() {
     token_admin.mint(&contributor, &500);
 
     let id = make_campaign(&env, &client, &creator, 1_000, 30, Category::Educator, 0);
+    client.verify_campaign(&id);
     client.contribute(&id, &contributor, &500);
     client.cancel_campaign(&id);
 
@@ -92,6 +96,7 @@ fn test_claim_refund_does_not_double_decrement_after_creator_cancel() {
     token_admin.mint(&contributor, &300);
 
     let id = make_campaign(&env, &client, &creator, 1_000, 30, Category::Learner, 0);
+    client.verify_campaign(&id);
     client.contribute(&id, &contributor, &300);
 
     assert_eq!(client.get_total_raised_global(), 300);
@@ -109,8 +114,7 @@ fn test_admin_cancel_decrements_total_raised_global() {
     let goal = 2_000i128;
     token_admin.mint(&contributor, &goal);
 
-    let id = make_campaign(&env, &client, &creator, goal, 30, Category::Educator, 0);
-    client.verify_campaign(&id);
+    let id = make_campaign(&env, &client, &creator, goal, 30, Category::Educator);
     client.contribute(&id, &contributor, &goal);
 
     assert_eq!(client.get_total_raised_global(), goal);
@@ -180,6 +184,7 @@ fn test_failed_funding_claim_refund_still_decrements_total_raised_global() {
     token_admin.mint(&contributor, &400);
 
     let id = make_campaign(&env, &client, &creator, 1_000, 30, Category::Learner, 0);
+    client.verify_campaign(&id);
     client.contribute(&id, &contributor, &400);
     assert_eq!(client.get_total_raised_global(), 400);
 
@@ -199,7 +204,18 @@ fn test_failed_funding_claim_refund_still_decrements_total_raised_global() {
 fn test_verify_campaigns_partial_failure_returns_both_vecs() {
     let (env, _admin, creator, _, _, _, _, client) = setup_env();
 
-    let good = make_campaign(&env, &client, &creator, 100, 30, Category::Learner, 0);
+    // Create an unverified campaign (bypass make_campaign which auto-verifies).
+    let good = client.create_campaign(&CreateCampaignParams {
+        creator: creator.clone(),
+        title: String::from_str(&env, "Verify Partial"),
+        description: String::from_str(&env, "Verify partial desc"),
+        funding_goal: 100,
+        duration_days: 30,
+        category: Category::Learner,
+        has_revenue_sharing: false,
+        revenue_share_percentage: 0,
+        max_contribution_per_user: 0i128,
+    });
     let bad_id: u32 = 9999;
 
     let (verified, failed) = client.verify_campaigns(&vec![&env, good, bad_id]);
@@ -285,10 +301,6 @@ fn test_extend_deadline_allowed_within_category_cap() {
 }
 
 // ── #814: BlockCampaignContributionCount is the live per-campaign key ──────────
-// There is no dead global BlockContributionCount variant in ContributionKey;
-// the split from DataKey removed it. The per-campaign burst-detection key is
-// exercised by the anomaly detection path in contribute(). This test verifies
-// the counts are truly per-campaign and independent of each other.
 
 #[test]
 fn test_burst_guard_block_counts_are_per_campaign_not_global() {
@@ -320,6 +332,20 @@ fn test_burst_guard_block_counts_are_per_campaign_not_global() {
     client.verify_campaign(&id_a);
     client.verify_campaign(&id_b);
 
+    let id_b = client.create_campaign(&CreateCampaignParams {
+        creator: creator.clone(),
+        title: String::from_str(&env, "Burst B"),
+        description: String::from_str(&env, "Burst campaign B"),
+        funding_goal: 1_000,
+        duration_days: 30,
+        category: Category::Educator,
+        has_revenue_sharing: false,
+        revenue_share_percentage: 0,
+        max_contribution_per_user: 0i128,
+    });
+    client.verify_campaign(&id_b);
+
+    // goal = 1_000; burst_check_threshold = 50% = 500
     // First contribution to each — amount_raised starts at 0 so the burst-check
     // early-exit fires and no block-count entry is written yet.
     client.contribute(&id_a, &contributor, &600); // A now at 600 (>50% threshold)
