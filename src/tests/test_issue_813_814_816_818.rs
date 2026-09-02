@@ -57,7 +57,12 @@ fn test_cancel_campaign_decrements_total_raised_global_immediately() {
 
     client.cancel_campaign(&id);
 
-    // total_raised_global must drop immediately on cancel, not wait for refund claims.
+    // #823: total_raised_global must remain escrowed after cancel until
+    // claim_refund actually moves the funds. The old #818 behaviour dropped it
+    // to 0 immediately, which would let accept_token_update swap the token
+    // while refunds are still owed in the old asset (fund-stranding).
+    assert_eq!(client.get_total_raised_global(), 500);
+    client.claim_refund(&id, &contributor);
     assert_eq!(client.get_total_raised_global(), 0);
 }
 
@@ -71,11 +76,10 @@ fn test_cancel_campaign_allows_accept_token_update_after_all_refunds_claimed() {
     client.contribute(&id, &contributor, &500);
     client.cancel_campaign(&id);
 
-    // total_raised_global is 0 immediately after cancel (#818 fix), so
-    // accept_token_update is no longer permanently blocked by unclaimed refunds.
-    assert_eq!(client.get_total_raised_global(), 0);
+    // Outstanding escrow keeps total_raised_global non-zero, so token swap
+    // must stay blocked until all refunds are claimed.
+    assert_eq!(client.get_total_raised_global(), 500);
 
-    // Claiming a refund after cancel must not underflow total_raised_global.
     client.claim_refund(&id, &contributor);
     assert_eq!(client.get_total_raised_global(), 0);
 }
@@ -91,10 +95,10 @@ fn test_claim_refund_does_not_double_decrement_after_creator_cancel() {
 
     assert_eq!(client.get_total_raised_global(), 300);
     client.cancel_campaign(&id);
-    assert_eq!(client.get_total_raised_global(), 0);
+    // Still 300 — claim_refund will decrement, not cancel itself (#823).
+    assert_eq!(client.get_total_raised_global(), 300);
 
     client.claim_refund(&id, &contributor);
-    // Still 0 — claim_refund skips the decrement for cancelled campaigns.
     assert_eq!(client.get_total_raised_global(), 0);
 }
 
@@ -112,7 +116,61 @@ fn test_admin_cancel_decrements_total_raised_global() {
 
     client.admin_cancel_campaign(&admin, &id, &String::from_str(&env, "fraud detected"));
 
+    // Admin cancel also must not drop the global counter until refunds are
+    // claimed; the funds are still escrowed in the old token.
+    assert_eq!(client.get_total_raised_global(), goal);
+    client.claim_refund(&id, &contributor);
     assert_eq!(client.get_total_raised_global(), 0);
+}
+
+// ── #823: accept_token_update must remain blocked after partial refund ────────
+
+#[test]
+fn test_accept_token_update_blocked_after_cancel_partial_refund_823() {
+    let (env, admin, creator, contributor1, contributor2, _token, token_admin, client) =
+        setup_env();
+    token_admin.mint(&contributor1, &1000);
+    token_admin.mint(&contributor2, &1000);
+
+    let campaign_id = client.create_campaign(&CreateCampaignParams {
+        creator: creator.clone(),
+        title: String::from_str(&env, "Refund Strand 823"),
+        description: String::from_str(&env, "Partial refund must block swap"),
+        funding_goal: 2000,
+        duration_days: 30,
+        category: Category::Educator,
+        has_revenue_sharing: false,
+        revenue_share_percentage: 0,
+        max_contribution_per_user: 0i128,
+    });
+    client.verify_campaign(&campaign_id);
+    client.contribute(&campaign_id, &contributor1, &500);
+    client.contribute(&campaign_id, &contributor2, &500);
+
+    // Cancel → ActiveCampaignCount → 0 but 1000 still escrowed in old token.
+    client.cancel_campaign(&campaign_id);
+    assert_eq!(client.get_total_raised_global(), 1000);
+
+    // Partial refund: only contributor1 claims.
+    client.claim_refund(&campaign_id, &contributor1);
+    assert_eq!(client.get_total_raised_global(), 500);
+
+    let new_token = env.register_stellar_asset_contract(admin.clone());
+    client.propose_token_update(&admin, &new_token);
+    env.ledger().with_mut(|l| {
+        l.timestamp += crate::TOKEN_UPDATE_DELAY_SECS + 1;
+    });
+
+    // Must be rejected: contributor2's 500 still escrowed in old token.
+    let res = client.try_accept_token_update(&admin);
+    assert_eq!(res.unwrap_err().unwrap(), Error::ValidationFailed);
+
+    // After the second refund the swap may proceed.
+    client.claim_refund(&campaign_id, &contributor2);
+    assert_eq!(client.get_total_raised_global(), 0);
+    let res2 = client.try_accept_token_update(&admin);
+    assert!(res2.is_ok());
+    assert_eq!(client.get_token(), new_token);
 }
 
 #[test]
